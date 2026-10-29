@@ -1,0 +1,43 @@
+name: Integración Continua (CI) - Logística
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  verificar-frontend:
+    name: Construir Frontend (Next.js)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+        
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          
+      - name: Instalar dependencias y compilar
+        run: |
+          cd frontend
+          npm install
+          npm run build
+
+  verificar-backend:
+    name: Preparar Backend (Python/FastAPI)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+        
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Instalar dependencias
+        run: |
+          cd backend
+          pip install -r requirements.txt || echo "Aún no hay requirements.txt"
