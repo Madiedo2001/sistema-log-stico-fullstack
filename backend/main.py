@@ -1,13 +1,17 @@
+import json
 import uuid
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import redis
 from worker import procesar_notificacion_envio
 
 app = FastAPI(title="API Sistema Logístico")
 
-# 1. Configurar CORS para permitir que el Frontend (React/Next.js) se conecte sin bloqueos
+# Conexión al cliente de Redis para caché
+redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,12 +31,10 @@ DB_CONFIG = {
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
-# Endpoint raíz para verificación de estado (Health Check / Pytest)
 @app.get("/")
 def read_root():
     return {"status": "ok", "message": "API Sistema Logístico activa"}
 
-# 2. Endpoint para inyectar datos de prueba (Seed)
 @app.post("/api/generar-datos-prueba")
 def generar_datos():
     conn = None
@@ -41,12 +43,10 @@ def generar_datos():
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Generar sufijo único para evitar errores de restricción UNIQUE
         uid = uuid.uuid4().hex[:6]
         email_unico = f"contacto_{uid}@acme.com"
         codigo_rastreo = f"TRK-{uid.upper()}"
 
-        # Crear usuario cliente
         cursor.execute("""
             INSERT INTO usuarios (nombre, email, password_hash, rol) 
             VALUES (%s, %s, 'hash123', 'cliente') 
@@ -54,7 +54,6 @@ def generar_datos():
         """, (f'Empresa ACME {uid}', email_unico))
         cliente_id = cursor.fetchone()[0]
 
-        # Crear paquete asociado
         cursor.execute("""
             INSERT INTO paquetes (cliente_id, descripcion, peso_kg, direccion_origen, direccion_destino) 
             VALUES (%s, 'Lote de Teclados Mecánicos', 15.5, 'Bodega Central', 'Sucursal Norte') 
@@ -62,16 +61,19 @@ def generar_datos():
         """, (cliente_id,))
         paquete_id = cursor.fetchone()[0]
 
-        # Crear envío asociado
         cursor.execute("""
             INSERT INTO envios (paquete_id, estado, codigo_rastreo) 
             VALUES (%s, 'pendiente', %s);
         """, (paquete_id, codigo_rastreo))
         
-        # Disparar tarea en segundo plano mediante Redis + Celery
+        # Disparar tarea en segundo plano
         procesar_notificacion_envio.delay(codigo_rastreo, email_unico)
 
         conn.commit()
+
+        # Invalidate el caché de envíos en Redis
+        redis_client.delete("cache:envios")
+
         return {
             "mensaje": "Datos de prueba generados exitosamente",
             "codigo_rastreo": codigo_rastreo,
@@ -87,9 +89,14 @@ def generar_datos():
         if conn:
             conn.close()
 
-# 3. Endpoint para consultar los envíos (El que consumirá el Frontend)
 @app.get("/api/envios")
 def obtener_envios():
+    # 1. Intentar obtener datos del caché de Redis
+    datos_cache = redis_client.get("cache:envios")
+    if datos_cache:
+        return json.loads(datos_cache)
+
+    # 2. Si no están en caché, consultar PostgreSQL
     conn = None
     cursor = None
     try:
@@ -103,6 +110,10 @@ def obtener_envios():
             ORDER BY e.fecha_actualizacion DESC;
         """)
         envios = cursor.fetchall()
+
+        # 3. Guardar en Redis con expiración de 60 segundos
+        redis_client.setex("cache:envios", 60, json.dumps(envios, default=str))
+
         return envios
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
