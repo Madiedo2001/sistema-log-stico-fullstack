@@ -1,19 +1,44 @@
 import json
+from typing import List
 import uuid
-from fastapi import FastAPI, HTTPException, Depends
+
+from auth import create_access_token, hash_password, require_roles, verify_password
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import redis
-
 from worker import procesar_notificacion_envio
-from auth import create_access_token, verify_password, require_roles, hash_password
 
 app = FastAPI(title="API Sistema Logístico")
 
 # Conexión al cliente de Redis para caché
-redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+redis_client = redis.Redis(
+    host="localhost", port=6379, db=0, decode_responses=True
+)
+
+
+# Gestor de conexiones WebSocket para actualizaciones en tiempo real
+class ConnectionManager:
+
+  def __init__(self):
+    self.active_connections: List[WebSocket] = []
+
+  async def connect(self, websocket: WebSocket):
+    await websocket.accept()
+    self.active_connections.append(websocket)
+
+  def disconnect(self, websocket: WebSocket):
+    if websocket in self.active_connections:
+      self.active_connections.remove(websocket)
+
+  async def broadcast(self, message: dict):
+    for connection in self.active_connections:
+      await connection.send_json(message)
+
+
+manager = ConnectionManager()
 
 # Configurar CORS
 app.add_middleware(
@@ -29,150 +54,247 @@ DB_CONFIG = {
     "user": "admin",
     "password": "adminpassword",
     "host": "localhost",
-    "port": "5432"
+    "port": "5432",
 }
 
-def get_db_connection():
-    return psycopg2.connect(**DB_CONFIG)
 
-# Esquema para recepción de credenciales en Login
+def get_db_connection():
+  return psycopg2.connect(**DB_CONFIG)
+
+
+# Esquemas Pydantic
 class LoginSchema(BaseModel):
-    email: str
-    password: str
+  email: str
+  password: str
+
+
+class ActualizarEstadoSchema(BaseModel):
+  nuevo_estado: str
+
 
 # 1. Endpoint raíz (Health Check para Pytest y supervisión)
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "API Sistema Logístico activa"}
+  return {"status": "ok", "message": "API Sistema Logístico activa"}
 
-# 2. Endpoint de Autenticación (Login con JWT)
+
+# 2. Canal WebSocket para el tablero en tiempo real
+@app.websocket("/ws/envios")
+async def websocket_endpoint(websocket: WebSocket):
+  await manager.connect(websocket)
+  try:
+    while True:
+      await websocket.receive_text()
+  except WebSocketDisconnect:
+    manager.disconnect(websocket)
+
+
+# 3. Endpoint de Autenticación (Login con JWT)
 @app.post("/api/auth/login")
 def login(credentials: LoginSchema):
-    conn = None
-    cursor = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT * FROM usuarios WHERE email = %s;", (credentials.email,))
-        usuario = cursor.fetchone()
+  conn = None
+  cursor = None
+  try:
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute(
+        "SELECT * FROM usuarios WHERE email = %s;", (credentials.email,)
+    )
+    usuario = cursor.fetchone()
 
-        if not usuario or not verify_password(credentials.password, usuario["password_hash"]):
-            raise HTTPException(status_code=401, detail="Credenciales incorrectas")
+    if not usuario or not verify_password(
+        credentials.password, usuario["password_hash"]
+    ):
+      raise HTTPException(status_code=401, detail="Credenciales incorrectas")
 
-        token = create_access_token({
-            "sub": str(usuario["id"]),
-            "email": usuario["email"],
-            "rol": usuario["rol"]
-        })
-        return {
-            "access_token": token,
-            "token_type": "bearer",
-            "rol": usuario["rol"]
-        }
-    except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+    token = create_access_token({
+        "sub": str(usuario["id"]),
+        "email": usuario["email"],
+        "rol": usuario["rol"],
+    })
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "rol": usuario["rol"],
+    }
+  except Exception as e:
+    if isinstance(e, HTTPException):
+      raise e
+    raise HTTPException(status_code=500, detail=str(e))
+  finally:
+    if cursor:
+      cursor.close()
+    if conn:
+      conn.close()
 
-# 3. Endpoint para inyectar datos de prueba (Seed cifrado + Celery)
+
+# 4. Endpoint para inyectar datos de prueba (Seed + Celery + WebSocket)
 @app.post("/api/generar-datos-prueba")
-def generar_datos():
-    conn = None
-    cursor = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+async def generar_datos():
+  conn = None
+  cursor = None
+  try:
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-        uid = uuid.uuid4().hex[:6]
-        email_unico = f"admin_{uid}@acme.com"
-        codigo_rastreo = f"TRK-{uid.upper()}"
-        
-        # Cifrar contraseña para permitir login posterior
-        hashed_password = hash_password("admin123")
+    uid = uuid.uuid4().hex[:6]
+    email_unico = f"admin_{uid}@acme.com"
+    codigo_rastreo = f"TRK-{uid.upper()}"
+    hashed_password = hash_password("admin123")
 
-        # Crear usuario administrador
-        cursor.execute("""
+    # Crear usuario administrador
+    cursor.execute(
+        """
             INSERT INTO usuarios (nombre, email, password_hash, rol) 
             VALUES (%s, %s, %s, 'admin') 
             RETURNING id;
-        """, (f'Empresa ACME {uid}', email_unico, hashed_password))
-        cliente_id = cursor.fetchone()[0]
+        """,
+        (f"Empresa ACME {uid}", email_unico, hashed_password),
+    )
+    cliente_id = cursor.fetchone()[0]
 
-        # Crear paquete asociado
-        cursor.execute("""
+    # Crear paquete asociado
+    cursor.execute(
+        """
             INSERT INTO paquetes (cliente_id, descripcion, peso_kg, direccion_origen, direccion_destino) 
             VALUES (%s, 'Lote de Teclados Mecánicos', 15.5, 'Bodega Central', 'Sucursal Norte') 
             RETURNING id;
-        """, (cliente_id,))
-        paquete_id = cursor.fetchone()[0]
+        """,
+        (cliente_id,),
+    )
+    paquete_id = cursor.fetchone()[0]
 
-        # Crear envío asociado
-        cursor.execute("""
+    # Crear envío asociado
+    cursor.execute(
+        """
             INSERT INTO envios (paquete_id, estado, codigo_rastreo) 
             VALUES (%s, 'pendiente', %s);
-        """, (paquete_id, codigo_rastreo))
-        
-        # Disparar tarea asíncrona en segundo plano mediante Redis + Celery
-        procesar_notificacion_envio.delay(codigo_rastreo, email_unico)
+        """,
+        (paquete_id, codigo_rastreo),
+    )
 
-        conn.commit()
+    # Disparar tarea asíncrona en segundo plano mediante Redis + Celery
+    procesar_notificacion_envio.delay(codigo_rastreo, email_unico)
 
-        # Invalidar caché de envíos en Redis
-        redis_client.delete("cache:envios")
+    conn.commit()
 
-        return {
-            "mensaje": "Datos de prueba generados exitosamente",
-            "codigo_rastreo": codigo_rastreo,
-            "email": email_unico,
-            "password_demo": "admin123",
-            "rol": "admin"
-        }
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+    # Invalidar caché de envíos en Redis
+    redis_client.delete("cache:envios")
 
-# 4. Endpoint para consultar envíos (Con caché de lectura Redis)
+    # Broadcast evento de nuevo envío vía WebSocket
+    await manager.broadcast({
+        "evento": "NUEVO_ENVIO",
+        "codigo_rastreo": codigo_rastreo,
+        "estado": "pendiente",
+        "cliente": f"Empresa ACME {uid}",
+    })
+
+    return {
+        "mensaje": "Datos de prueba generados exitosamente",
+        "codigo_rastreo": codigo_rastreo,
+        "email": email_unico,
+        "password_demo": "admin123",
+        "rol": "admin",
+    }
+  except Exception as e:
+    if conn:
+      conn.rollback()
+    raise HTTPException(status_code=500, detail=str(e))
+  finally:
+    if cursor:
+      cursor.close()
+    if conn:
+      conn.close()
+
+
+# 5. Endpoint para actualizar el estado de un envío (PATCH + Invalidación de Caché + Broadcast WS)
+@app.patch("/api/envios/{codigo_rastreo}")
+async def actualizar_estado_envio(
+    codigo_rastreo: str, payload: ActualizarEstadoSchema
+):
+  conn = None
+  cursor = None
+  try:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+            UPDATE envios 
+            SET estado = %s, fecha_actualizacion = CURRENT_TIMESTAMP 
+            WHERE codigo_rastreo = %s 
+            RETURNING id;
+        """,
+        (payload.nuevo_estado, codigo_rastreo),
+    )
+
+    filas_afectadas = cursor.fetchone()
+    if not filas_afectadas:
+      raise HTTPException(
+          status_code=404, detail="Código de rastreo no encontrado"
+      )
+
+    conn.commit()
+
+    # Invalidar caché en Redis
+    redis_client.delete("cache:envios")
+
+    # Broadcast actualización de estado vía WebSocket
+    await manager.broadcast({
+        "evento": "ESTADO_ACTUALIZADO",
+        "codigo_rastreo": codigo_rastreo,
+        "estado": payload.nuevo_estado,
+    })
+
+    return {
+        "mensaje": (
+            f"Envío {codigo_rastreo} actualizado a '{payload.nuevo_estado}'"
+        )
+    }
+  except Exception as e:
+    if conn:
+      conn.rollback()
+    if isinstance(e, HTTPException):
+      raise e
+    raise HTTPException(status_code=500, detail=str(e))
+  finally:
+    if cursor:
+      cursor.close()
+    if conn:
+      conn.close()
+
+
+# 6. Endpoint para consultar envíos (Con caché de lectura Redis)
 @app.get("/api/envios")
 def obtener_envios():
-    # 1. Intentar obtener respuesta desde el caché en Redis
-    datos_cache = redis_client.get("cache:envios")
-    if datos_cache:
-        return json.loads(datos_cache)
+  # 1. Intentar obtener respuesta desde el caché en Redis
+  datos_cache = redis_client.get("cache:envios")
+  if datos_cache:
+    return json.loads(datos_cache)
 
-    # 2. Si no existe en caché, consultar PostgreSQL
-    conn = None
-    cursor = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("""
+  # 2. Si no existe en caché, consultar PostgreSQL
+  conn = None
+  cursor = None
+  try:
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("""
             SELECT e.codigo_rastreo, e.estado, p.descripcion, p.peso_kg, p.direccion_destino, u.nombre as cliente
             FROM envios e
             JOIN paquetes p ON e.paquete_id = p.id
             JOIN usuarios u ON p.cliente_id = u.id
             ORDER BY e.fecha_actualizacion DESC;
         """)
-        envios = cursor.fetchall()
+    envios = cursor.fetchall()
 
-        # 3. Guardar en Redis con expiración de 60 segundos
-        redis_client.setex("cache:envios", 60, json.dumps(envios, default=str))
+    # 3. Guardar en Redis con expiración de 60 segundos
+    redis_client.setex("cache:envios", 60, json.dumps(envios, default=str))
 
-        return envios
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+    return envios
+  except Exception as e:
+    raise HTTPException(status_code=500, detail=str(e))
+  finally:
+    if cursor:
+      cursor.close()
+    if conn:
+      conn.close()
