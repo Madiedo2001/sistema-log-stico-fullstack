@@ -1,7 +1,9 @@
+import uuid
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from worker import procesar_notificacion_envio
 
 app = FastAPI(title="API Sistema Logístico")
 
@@ -39,15 +41,20 @@ def generar_datos():
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Crear un usuario cliente
+        # Generar sufijo único para evitar errores de restricción UNIQUE
+        uid = uuid.uuid4().hex[:6]
+        email_unico = f"contacto_{uid}@acme.com"
+        codigo_rastreo = f"TRK-{uid.upper()}"
+
+        # Crear usuario cliente
         cursor.execute("""
             INSERT INTO usuarios (nombre, email, password_hash, rol) 
-            VALUES ('Empresa ACME', 'contacto@acme.com', 'hash123', 'cliente') 
+            VALUES (%s, %s, 'hash123', 'cliente') 
             RETURNING id;
-        """)
+        """, (f'Empresa ACME {uid}', email_unico))
         cliente_id = cursor.fetchone()[0]
 
-        # Crear un paquete asociado al cliente
+        # Crear paquete asociado
         cursor.execute("""
             INSERT INTO paquetes (cliente_id, descripcion, peso_kg, direccion_origen, direccion_destino) 
             VALUES (%s, 'Lote de Teclados Mecánicos', 15.5, 'Bodega Central', 'Sucursal Norte') 
@@ -55,14 +62,21 @@ def generar_datos():
         """, (cliente_id,))
         paquete_id = cursor.fetchone()[0]
 
-        # Crear el envío asociado al paquete
+        # Crear envío asociado
         cursor.execute("""
             INSERT INTO envios (paquete_id, estado, codigo_rastreo) 
-            VALUES (%s, 'pendiente', 'TRK-987654321');
-        """, (paquete_id,))
+            VALUES (%s, 'pendiente', %s);
+        """, (paquete_id, codigo_rastreo))
         
+        # Disparar tarea en segundo plano mediante Redis + Celery
+        procesar_notificacion_envio.delay(codigo_rastreo, email_unico)
+
         conn.commit()
-        return {"mensaje": "Datos de prueba generados exitosamente"}
+        return {
+            "mensaje": "Datos de prueba generados exitosamente",
+            "codigo_rastreo": codigo_rastreo,
+            "email": email_unico
+        }
     except Exception as e:
         if conn:
             conn.rollback()
