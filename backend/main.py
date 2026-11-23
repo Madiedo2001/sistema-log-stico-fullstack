@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -25,12 +25,20 @@ DB_CONFIG = {
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
+# Endpoint raíz para verificación de estado (Health Check / Pytest)
+@app.get("/")
+def read_root():
+    return {"status": "ok", "message": "API Sistema Logístico activa"}
+
 # 2. Endpoint para inyectar datos de prueba (Seed)
 @app.post("/api/generar-datos-prueba")
 def generar_datos():
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    conn = None
+    cursor = None
     try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
         # Crear un usuario cliente
         cursor.execute("""
             INSERT INTO usuarios (nombre, email, password_hash, rol) 
@@ -56,25 +64,36 @@ def generar_datos():
         conn.commit()
         return {"mensaje": "Datos de prueba generados exitosamente"}
     except Exception as e:
-        conn.rollback()
-        return {"error": str(e)}
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        cursor.close()
-        conn.close()
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 # 3. Endpoint para consultar los envíos (El que consumirá el Frontend)
 @app.get("/api/envios")
 def obtener_envios():
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    cursor.execute("""
-        SELECT e.codigo_rastreo, e.estado, p.descripcion, p.peso_kg, p.direccion_destino, u.nombre as cliente
-        FROM envios e
-        JOIN paquetes p ON e.paquete_id = p.id
-        JOIN usuarios u ON p.cliente_id = u.id
-        ORDER BY e.fecha_actualizacion DESC;
-    """)
-    envios = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return envios
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT e.codigo_rastreo, e.estado, p.descripcion, p.peso_kg, p.direccion_destino, u.nombre as cliente
+            FROM envios e
+            JOIN paquetes p ON e.paquete_id = p.id
+            JOIN usuarios u ON p.cliente_id = u.id
+            ORDER BY e.fecha_actualizacion DESC;
+        """)
+        envios = cursor.fetchall()
+        return envios
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
